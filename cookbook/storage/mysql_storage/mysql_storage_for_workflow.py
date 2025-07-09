@@ -87,8 +87,8 @@ if __name__ == "__main__":
         table_name="workflow_sessions", db_url=db_url, auto_upgrade_schema=True
     )
     storage.drop()
-    report: Iterator[RunResponse] = HackerNewsReporter(
-        storage=storage
-    ).run(num_stories=5)
+    report: Iterator[RunResponse] = HackerNewsReporter(storage=storage).run(
+        num_stories=5
+    )
     # Print the report
     pprint_run_response(report, markdown=True, show_time=True)

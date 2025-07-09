@@ -51,9 +51,7 @@ def workflow_storage(mock_engine, mock_session):
     """Create a MySQLStorage instance for workflow mode with mocked components."""
     with patch("agno.storage.mysql.scoped_session", return_value=mock_session[0]):
         with patch("agno.storage.mysql.inspect", return_value=MagicMock()):
-            storage = MySQLStorage(
-                table_name="workflow_sessions", schema="ai", db_engine=mock_engine, mode="workflow"
-            )
+            storage = MySQLStorage(table_name="workflow_sessions", schema="ai", db_engine=mock_engine, mode="workflow")
             # Mock table_exists to return True
             storage.table_exists = MagicMock(return_value=True)
             return storage, mock_session[1]
@@ -369,35 +367,34 @@ def test_schema_upgrade(agent_storage):
 
     # Test upgrade_schema
     storage.upgrade_schema()
-    
+
     # Verify ALTER TABLE was called
     calls = mock_session.execute.call_args_list
-    alter_table_called = any(
-        "ALTER TABLE" in str(call) for call in calls
-    )
+    alter_table_called = any("ALTER TABLE" in str(call) for call in calls)
     assert alter_table_called or storage._schema_up_to_date
 
 
 def test_mysql_specific_features(agent_storage):
     """Test MySQL-specific features like backtick quoting."""
     storage, mock_session = agent_storage
-    
+
     # Reset table_exists to test actual implementation
     storage.table_exists = MySQLStorage.table_exists.__get__(storage)
-    
+
     # Mock execute to capture SQL queries
     executed_queries = []
+
     def capture_execute(query, *args, **kwargs):
         executed_queries.append(str(query))
         result = MagicMock()
         result.scalar = MagicMock(return_value=1)
         return result
-    
+
     mock_session.execute = MagicMock(side_effect=capture_execute)
-    
+
     # Call table_exists to trigger query
     storage.table_exists()
-    
+
     # Verify information_schema query is used (MySQL style)
     assert any("information_schema.tables" in query for query in executed_queries)
 
@@ -405,19 +402,19 @@ def test_mysql_specific_features(agent_storage):
 def test_deepcopy(agent_storage):
     """Test deep copying of MySQLStorage instance."""
     storage, _ = agent_storage
-    
+
     import copy
-    
+
     # Test deepcopy
     copied_storage = copy.deepcopy(storage)
-    
+
     # Verify essential attributes are preserved
     assert copied_storage.table_name == storage.table_name
     assert copied_storage.schema == storage.schema
     assert copied_storage.mode == storage.mode
     assert copied_storage.schema_version == storage.schema_version
     assert copied_storage.auto_upgrade_schema == storage.auto_upgrade_schema
-    
+
     # Verify db_engine is the same (not copied)
     assert copied_storage.db_engine is storage.db_engine
 
@@ -425,17 +422,17 @@ def test_deepcopy(agent_storage):
 def test_error_handling(agent_storage):
     """Test error handling for various scenarios."""
     storage, mock_session = agent_storage
-    
+
     # Test 1: Read with table doesn't exist error
     mock_session.execute.side_effect = Exception("Table 'ai.agent_sessions' doesn't exist")
-    
+
     # Reset read method
     storage.read = MySQLStorage.read.__get__(storage)
-    
+
     # Should handle error gracefully and return None
     result = storage.read("test-session")
     assert result is None
-    
+
     # Test 2: Verify upsert calls create when table doesn't exist
     # We'll test this by directly verifying the logic path
     session = AgentSession(
@@ -443,32 +440,32 @@ def test_error_handling(agent_storage):
         agent_id="test-agent",
         user_id="test-user",
     )
-    
+
     # Setup the scenario where upsert fails and needs to create table
     original_table_exists = storage.table_exists
     create_called = False
-    
+
     def track_create():
         nonlocal create_called
         create_called = True
-    
+
     # Override methods
     storage.table_exists = MagicMock(return_value=False)
     storage.create = MagicMock(side_effect=track_create)
     storage.read = MagicMock(return_value=session)
-    
+
     # Setup mock session to fail initially
     def failing_execute(*args, **kwargs):
         if not create_called:
             raise Exception("Table doesn't exist")
         return MagicMock()
-    
+
     mock_session.execute = MagicMock(side_effect=failing_execute)
     mock_session.begin.return_value.__enter__.return_value = mock_session
-    
+
     # Get the actual upsert method
     storage.upsert = MySQLStorage.upsert.__get__(storage)
-    
+
     # Call upsert - it should fail, check table_exists, call create, then succeed
     try:
         result = storage.upsert(session, create_and_retry=True)
@@ -477,23 +474,23 @@ def test_error_handling(agent_storage):
     except Exception:
         # Even if it fails, create should have been called
         assert create_called
-    
+
     # Verify create was actually called
     storage.create.assert_called()
-    
+
     # Restore original
     storage.table_exists = original_table_exists
-    
+
     # Test 3: Error handling in get methods
     mock_session.execute.side_effect = Exception("doesn't exist")
-    
+
     # These should handle errors gracefully
     storage.get_all_sessions = MySQLStorage.get_all_sessions.__get__(storage)
     assert storage.get_all_sessions() == []
-    
+
     storage.get_all_session_ids = MySQLStorage.get_all_session_ids.__get__(storage)
     assert storage.get_all_session_ids() == []
-    
+
     storage.get_recent_sessions = MySQLStorage.get_recent_sessions.__get__(storage)
     assert storage.get_recent_sessions() == []
 
@@ -505,33 +502,27 @@ def test_all_modes_table_structure():
             with patch("agno.storage.mysql.create_engine"):
                 # Test agent mode columns
                 agent_storage = MySQLStorage(
-                    table_name="agent_table",
-                    db_url="mysql+pymysql://user:pass@localhost/db",
-                    mode="agent"
+                    table_name="agent_table", db_url="mysql+pymysql://user:pass@localhost/db", mode="agent"
                 )
                 agent_table = agent_storage.get_table()
                 agent_columns = {c.name for c in agent_table.columns}
                 assert "agent_id" in agent_columns
                 assert "team_session_id" in agent_columns
                 assert "agent_data" in agent_columns
-                
+
                 # Test team mode columns
                 team_storage = MySQLStorage(
-                    table_name="team_table",
-                    db_url="mysql+pymysql://user:pass@localhost/db",
-                    mode="team"
+                    table_name="team_table", db_url="mysql+pymysql://user:pass@localhost/db", mode="team"
                 )
                 team_table = team_storage.get_table()
                 team_columns = {c.name for c in team_table.columns}
                 assert "team_id" in team_columns
                 assert "team_session_id" in team_columns
                 assert "team_data" in team_columns
-                
+
                 # Test workflow mode columns
                 workflow_storage = MySQLStorage(
-                    table_name="workflow_table",
-                    db_url="mysql+pymysql://user:pass@localhost/db",
-                    mode="workflow"
+                    table_name="workflow_table", db_url="mysql+pymysql://user:pass@localhost/db", mode="workflow"
                 )
                 workflow_table = workflow_storage.get_table()
                 workflow_columns = {c.name for c in workflow_table.columns}

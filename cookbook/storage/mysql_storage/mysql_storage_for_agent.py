@@ -14,4 +14,6 @@ agent = Agent(
 agent.print_response("How many people live in Canada?")
 agent.print_response("What is their national anthem called?")
 
-print(f"Session IDs created in DB: {agent.storage.get_all_session_ids(entity_id=agent.agent_id)}")
+print(
+    f"Session IDs created in DB: {agent.storage.get_all_session_ids(entity_id=agent.agent_id)}"
+)

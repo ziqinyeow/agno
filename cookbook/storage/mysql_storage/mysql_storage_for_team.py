@@ -62,4 +62,6 @@ hn_team = Team(
 hn_team.print_response("Write an article about the top 2 stories on hackernews")
 
 
-print(f"Session IDs created in DB: {hn_team.storage.get_all_session_ids(entity_id=hn_team.team_id)}")
+print(
+    f"Session IDs created in DB: {hn_team.storage.get_all_session_ids(entity_id=hn_team.team_id)}"
+)
