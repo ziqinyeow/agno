@@ -709,6 +709,7 @@ class Team:
             self.session_state = session_state
 
         self._initialize_session_state(user_id=user_id, session_id=session_id)
+
         # Read existing session from storage
         self.read_from_storage(session_id=session_id)
 
@@ -5052,6 +5053,7 @@ class Team:
             _instructions = self.instructions
             if callable(self.instructions):
                 import inspect
+
                 signature = inspect.signature(self.instructions)
                 if "team" in signature.parameters:
                     _instructions = self.instructions(team=self)
@@ -5858,7 +5860,7 @@ class Team:
             )
 
             # 3. Create the member agent task
-            member_agent_task = self._formate_member_agent_task(
+            member_agent_task = self._format_member_agent_task(
                 task_description, expected_output, team_context_str, team_member_interactions_str
             )
 
@@ -5971,7 +5973,7 @@ class Team:
             )
 
             # 3. Create the member agent task
-            member_agent_task = self._formate_member_agent_task(
+            member_agent_task = self._format_member_agent_task(
                 task_description, expected_output, team_context_str, team_member_interactions_str
             )
 
@@ -5994,6 +5996,7 @@ class Team:
                         audio=audio,
                         files=files,
                         stream=False,
+                        refresh_session_before_write=True,
                     )
                     check_if_run_cancelled(response)
 
@@ -6150,7 +6153,7 @@ class Team:
             )
 
             # 3. Create the member agent task
-            member_agent_task = self._formate_member_agent_task(
+            member_agent_task = self._format_member_agent_task(
                 task_description, expected_output, team_context_str, team_member_interactions_str
             )
 
@@ -6288,7 +6291,7 @@ class Team:
             )
 
             # 3. Create the member agent task
-            member_agent_task = self._formate_member_agent_task(
+            member_agent_task = self._format_member_agent_task(
                 task_description, expected_output, team_context_str, team_member_interactions_str
             )
 
@@ -6314,6 +6317,7 @@ class Team:
                     knowledge_filters=knowledge_filters
                     if not member_agent.knowledge_filters and member_agent.knowledge
                     else None,
+                    refresh_session_before_write=True,
                 )
                 async for member_agent_run_response_event in member_agent_run_response_stream:
                     check_if_run_cancelled(member_agent_run_response_event)
@@ -6332,6 +6336,7 @@ class Team:
                     knowledge_filters=knowledge_filters
                     if not member_agent.knowledge_filters and member_agent.knowledge
                     else None,
+                    refresh_session_before_write=True,
                 )
                 check_if_run_cancelled(member_agent_run_response)
 
@@ -6396,7 +6401,7 @@ class Team:
 
         return transfer_func
 
-    def _formate_member_agent_task(
+    def _format_member_agent_task(
         self,
         task_description: str,
         expected_output: Optional[str] = None,
@@ -6680,6 +6685,7 @@ class Team:
                     knowledge_filters=knowledge_filters
                     if not member_agent.knowledge_filters and member_agent.knowledge
                     else None,
+                    refresh_session_before_write=True,
                 )
                 async for member_agent_run_response_event in member_agent_run_response_stream:
                     check_if_run_cancelled(member_agent_run_response_event)
@@ -6698,6 +6704,7 @@ class Team:
                     knowledge_filters=knowledge_filters
                     if (member_agent.knowledge_filters and member_agent.knowledge)
                     else None,
+                    refresh_session_before_write=True,
                 )
 
                 try:
