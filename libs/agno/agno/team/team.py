@@ -5689,6 +5689,13 @@ class Team:
                 return Message.model_validate(message)
             except Exception as e:
                 log_warning(f"Failed to validate message: {e}")
+        elif isinstance(message, BaseModel):
+            try:
+                # Create a user message with the BaseModel content
+                content = message.model_dump_json(indent=2, exclude_none=True)
+                return Message(role="user", content=content)
+            except Exception as e:
+                log_warning(f"Failed to convert BaseModel to message: {e}")
 
     def get_messages_for_parser_model(
         self, model_response: ModelResponse, response_format: Optional[Union[Dict, Type[BaseModel]]]
@@ -7119,9 +7126,10 @@ class Team:
                     # If the session_state is already set, merge the session_state from the database with the current session_state
                     if self.session_state is not None and len(self.session_state) > 0:
                         # This updates session_state_from_db
-                        merge_dictionaries(session_state_from_db, self.session_state)
-                    # Update the current session_state
-                    self.session_state = session_state_from_db
+                        merge_dictionaries(self.session_state, session_state_from_db)
+                    else:
+                        # Update the current session_state
+                        self.session_state = session_state_from_db
 
             if "team_session_state" in session.session_data:
                 team_session_state_from_db = session.session_data.get("team_session_state")
