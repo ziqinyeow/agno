@@ -7,6 +7,7 @@ from types import TracebackType
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from agno.tools import Toolkit
+from concurrent.futures import ThreadPoolExecutor
 from agno.tools.function import Function
 from agno.utils.log import log_debug, log_info, log_warning, logger
 from agno.utils.mcp import get_entrypoint_for_tool
@@ -55,7 +56,9 @@ def _prepare_command(command: str) -> list[str]:
 
     executable = parts[0].split("/")[-1]
     if executable not in ALLOWED_COMMANDS:
-        raise ValueError(f"MCP command needs to use one of the following executables: {ALLOWED_COMMANDS}")
+        raise ValueError(
+            f"MCP command needs to use one of the following executables: {ALLOWED_COMMANDS}"
+        )
 
     return parts
 
@@ -99,7 +102,9 @@ class MCPTools(Toolkit):
         url: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
-        server_params: Optional[Union[StdioServerParameters, SSEClientParams, StreamableHTTPClientParams]] = None,
+        server_params: Optional[
+            Union[StdioServerParameters, SSEClientParams, StreamableHTTPClientParams]
+        ] = None,
         session: Optional[ClientSession] = None,
         timeout_seconds: int = 5,
         client=None,
@@ -125,7 +130,9 @@ class MCPTools(Toolkit):
         super().__init__(name="MCPTools", **kwargs)
 
         if transport == "sse":
-            log_info("SSE as a standalone transport is deprecated. Please use Streamable HTTP instead.")
+            log_info(
+                "SSE as a standalone transport is deprecated. Please use Streamable HTTP instead."
+            )
 
         # Set these after `__init__` to bypass the `_check_tools_filters`
         # because tools are not available until `initialize()` is called.
@@ -134,7 +141,9 @@ class MCPTools(Toolkit):
 
         if session is None and server_params is None:
             if transport == "sse" and url is None:
-                raise ValueError("One of 'url' or 'server_params' parameters must be provided when using SSE transport")
+                raise ValueError(
+                    "One of 'url' or 'server_params' parameters must be provided when using SSE transport"
+                )
             if transport == "stdio" and command is None:
                 raise ValueError(
                     "One of 'command' or 'server_params' parameters must be provided when using stdio transport"
@@ -164,9 +173,9 @@ class MCPTools(Toolkit):
 
         self.timeout_seconds = timeout_seconds
         self.session: Optional[ClientSession] = session
-        self.server_params: Optional[Union[StdioServerParameters, SSEClientParams, StreamableHTTPClientParams]] = (
-            server_params
-        )
+        self.server_params: Optional[
+            Union[StdioServerParameters, SSEClientParams, StreamableHTTPClientParams]
+        ] = server_params
         self.transport = transport
         self.url = url
 
@@ -183,7 +192,9 @@ class MCPTools(Toolkit):
             parts = _prepare_command(command)
             cmd = parts[0]
             arguments = parts[1:] if len(parts) > 1 else []
-            self.server_params = StdioServerParameters(command=cmd, args=arguments, env=env)
+            self.server_params = StdioServerParameters(
+                command=cmd, args=arguments, env=env
+            )
 
         self._client = client
         self._context = None
@@ -216,6 +227,12 @@ class MCPTools(Toolkit):
         if self._initialized:
             return
 
+        # For streamable-http, avoid creating persistent contexts/sessions.
+        # Perform transient initialization to register tools and exit.
+        if self.transport == "streamable-http":
+            await self._initialize_streamable_http_transient()
+            return
+
         if self.session is not None:
             await self.initialize()
             return
@@ -229,22 +246,19 @@ class MCPTools(Toolkit):
             if "url" not in sse_params:
                 sse_params["url"] = self.url
             self._context = sse_client(**sse_params)  # type: ignore
-            client_timeout = min(self.timeout_seconds, sse_params.get("timeout", self.timeout_seconds))
+            client_timeout = min(
+                self.timeout_seconds, sse_params.get("timeout", self.timeout_seconds)
+            )
 
-        # Create a new streamable HTTP session
+        # Create a new streamable HTTP session (handled transiently above)
         elif self.transport == "streamable-http":
-            streamable_http_params = asdict(self.server_params) if self.server_params is not None else {}  # type: ignore
-            if "url" not in streamable_http_params:
-                streamable_http_params["url"] = self.url
-            self._context = streamablehttp_client(**streamable_http_params)  # type: ignore
-            params_timeout = streamable_http_params.get("timeout", self.timeout_seconds)
-            if isinstance(params_timeout, timedelta):
-                params_timeout = int(params_timeout.total_seconds())
-            client_timeout = min(self.timeout_seconds, params_timeout)
+            raise RuntimeError("Unexpected persistent streamable-http connection path")
 
         else:
             if self.server_params is None:
-                raise ValueError("server_params must be provided when using stdio transport.")
+                raise ValueError(
+                    "server_params must be provided when using stdio transport."
+                )
             self._context = stdio_client(self.server_params)  # type: ignore
             client_timeout = self.timeout_seconds
 
@@ -261,14 +275,27 @@ class MCPTools(Toolkit):
 
     async def close(self) -> None:
         """Close the MCP connection and clean up resources"""
+        # No-op for streamable-http, since connections are per-call and already closed
+        if self.transport == "streamable-http":
+            self._initialized = False
+            return
+
         if self._session_context is not None:
-            await self._session_context.__aexit__(None, None, None)
-            self.session = None
-            self._session_context = None
+            try:
+                await self._session_context.__aexit__(None, None, None)
+            except RuntimeError as exc:
+                log_warning(f"Ignoring session close RuntimeError: {exc}")
+            finally:
+                self.session = None
+                self._session_context = None
 
         if self._context is not None:
-            await self._context.__aexit__(None, None, None)
-            self._context = None
+            try:
+                await self._context.__aexit__(None, None, None)
+            except RuntimeError as exc:
+                log_warning(f"Ignoring context close RuntimeError: {exc}")
+            finally:
+                self._context = None
 
         self._initialized = False
 
@@ -292,6 +319,11 @@ class MCPTools(Toolkit):
     async def initialize(self) -> None:
         """Initialize the MCP toolkit by getting available tools from the MCP server"""
         if self._initialized:
+            return
+
+        # Handle streamable-http with transient discovery
+        if self.transport == "streamable-http":
+            await self._initialize_streamable_http_transient()
             return
 
         try:
@@ -319,31 +351,121 @@ class MCPTools(Toolkit):
                     filtered_tools.append(tool)
 
             # Register the tools with the toolkit
-            for tool in filtered_tools:
-                try:
-                    # Get an entrypoint for the tool
-                    entrypoint = get_entrypoint_for_tool(tool, self.session)
-                    # Create a Function for the tool
-                    f = Function(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.inputSchema,
-                        entrypoint=entrypoint,
-                        # Set skip_entrypoint_processing to True to avoid processing the entrypoint
-                        skip_entrypoint_processing=True,
-                    )
-
-                    # Register the Function with the toolkit
-                    self.functions[f.name] = f
-                    log_debug(f"Function: {f.name} registered with {self.name}")
-                except Exception as e:
-                    logger.error(f"Failed to register tool {tool.name}: {e}")
+            self._register_tools(filtered_tools)
 
             log_debug(f"{self.name} initialized with {len(filtered_tools)} tools")
             self._initialized = True
         except Exception as e:
             logger.error(f"Failed to get MCP tools: {e}")
             raise
+
+    async def _initialize_streamable_http_transient(self) -> None:
+        """Discover tools via a short-lived streamable-http session and register sync entrypoints."""
+        try:
+            stream_params = (
+                asdict(self.server_params) if self.server_params is not None else {}
+            )
+            if "url" not in stream_params and self.url is not None:
+                stream_params["url"] = self.url
+            stream_params.setdefault("terminate_on_close", True)
+
+            # Open a transient connection only for discovery
+            async with streamablehttp_client(**stream_params) as client_conn:
+                read, write = client_conn[0:2]
+                async with ClientSession(
+                    read,
+                    write,
+                    read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                ) as session:
+                    await session.initialize()
+                    available_tools = await session.list_tools()
+
+            # Apply include/exclude filters
+            filtered_tools = []
+            for tool in available_tools.tools:
+                if self.exclude_tools and tool.name in self.exclude_tools:
+                    continue
+                if self.include_tools is None or tool.name in self.include_tools:
+                    filtered_tools.append(tool)
+
+            # Register sync entrypoints for these tools
+            self._register_tools(filtered_tools)
+            log_debug(
+                f"{self.name} initialized with {len(filtered_tools)} tools (streamable-http)"
+            )
+            self._initialized = True
+        except Exception as e:
+            logger.error(f"Failed to get MCP tools (streamable-http): {e}")
+            raise
+
+    def _register_tools(self, tools_list):
+        """Register tools with appropriate entrypoints based on transport."""
+        for tool in tools_list:
+            try:
+                # For streamable-http transport, register a synchronous entrypoint so Agent.run can be used.
+                if self.transport == "streamable-http":
+
+                    def make_sync_entrypoint(tool_name: str):
+                        def sync_entrypoint(**arguments):
+                            async def _invoke():
+                                # Build params from configured server_params/url
+                                stream_params = (
+                                    asdict(self.server_params)
+                                    if self.server_params is not None
+                                    else {}
+                                )
+                                if "url" not in stream_params and self.url is not None:
+                                    stream_params["url"] = self.url
+                                # Ensure termination on close to avoid lingering connections
+                                stream_params.setdefault("terminate_on_close", True)
+                                async with streamablehttp_client(
+                                    **stream_params
+                                ) as client_conn:
+                                    read, write = client_conn[0:2]
+                                    async with ClientSession(
+                                        read,
+                                        write,
+                                        read_timeout_seconds=timedelta(
+                                            seconds=self.timeout_seconds
+                                        ),
+                                    ) as session:
+                                        await session.initialize()
+                                        return await session.call_tool(
+                                            tool_name, arguments
+                                        )
+
+                            # Run the async invocation inside a dedicated worker thread with its own loop
+                            def run_in_thread():
+                                import asyncio as _asyncio
+
+                                return _asyncio.run(_invoke())
+
+                            with ThreadPoolExecutor(max_workers=1) as executor:
+                                future = executor.submit(run_in_thread)
+                                return future.result()
+
+                        return sync_entrypoint
+
+                    entrypoint_callable = make_sync_entrypoint(tool.name)
+                else:
+                    # Default: use the async entrypoint (works with Agent.arun/Team.aprint_response)
+                    entrypoint_callable = get_entrypoint_for_tool(tool, self.session)
+
+                # Create a Function for the tool
+                f = Function(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.inputSchema,
+                    entrypoint=entrypoint_callable,
+                    # Set skip_entrypoint_processing to True to avoid processing the entrypoint
+                    skip_entrypoint_processing=True,
+                )
+
+                # Register the Function with the toolkit
+                self.functions[f.name] = f
+                log_debug(f"Function: {f.name} registered with {self.name}")
+            except Exception as e:
+                logger.error(f"Failed to register tool {tool.name}: {e}")
 
 
 class MultiMCPTools(Toolkit):
@@ -365,7 +487,11 @@ class MultiMCPTools(Toolkit):
         *,
         env: Optional[dict[str, str]] = None,
         server_params_list: Optional[
-            List[Union[SSEClientParams, StdioServerParameters, StreamableHTTPClientParams]]
+            List[
+                Union[
+                    SSEClientParams, StdioServerParameters, StreamableHTTPClientParams
+                ]
+            ]
         ] = None,
         timeout_seconds: int = 5,
         client=None,
@@ -391,7 +517,9 @@ class MultiMCPTools(Toolkit):
 
         if urls_transports is not None:
             if "sse" in urls_transports:
-                log_info("SSE as a standalone transport is deprecated. Please use Streamable HTTP instead.")
+                log_info(
+                    "SSE as a standalone transport is deprecated. Please use Streamable HTTP instead."
+                )
 
         if urls is not None:
             if urls_transports is None:
@@ -400,7 +528,9 @@ class MultiMCPTools(Toolkit):
                 )
             else:
                 if len(urls) != len(urls_transports):
-                    raise ValueError("urls and urls_transports must be of the same length")
+                    raise ValueError(
+                        "urls and urls_transports must be of the same length"
+                    )
 
         # Set these after `__init__` to bypass the `_check_tools_filters`
         # beacuse tools are not available until `initialize()` is called.
@@ -408,11 +538,13 @@ class MultiMCPTools(Toolkit):
         self.exclude_tools = exclude_tools
 
         if server_params_list is None and commands is None and urls is None:
-            raise ValueError("Either server_params_list or commands or urls must be provided")
+            raise ValueError(
+                "Either server_params_list or commands or urls must be provided"
+            )
 
-        self.server_params_list: List[Union[SSEClientParams, StdioServerParameters, StreamableHTTPClientParams]] = (
-            server_params_list or []
-        )
+        self.server_params_list: List[
+            Union[SSEClientParams, StdioServerParameters, StreamableHTTPClientParams]
+        ] = (server_params_list or [])
         self.timeout_seconds = timeout_seconds
         self.commands: Optional[List[str]] = commands
         self.urls: Optional[List[str]] = urls
@@ -430,13 +562,17 @@ class MultiMCPTools(Toolkit):
                 parts = _prepare_command(command)
                 cmd = parts[0]
                 arguments = parts[1:] if len(parts) > 1 else []
-                self.server_params_list.append(StdioServerParameters(command=cmd, args=arguments, env=env))
+                self.server_params_list.append(
+                    StdioServerParameters(command=cmd, args=arguments, env=env)
+                )
 
         if urls is not None:
             if urls_transports is not None:
                 for url, transport in zip(urls, urls_transports):
                     if transport == "streamable-http":
-                        self.server_params_list.append(StreamableHTTPClientParams(url=url))
+                        self.server_params_list.append(
+                            StreamableHTTPClientParams(url=url)
+                        )
                     else:
                         self.server_params_list.append(SSEClientParams(url=url))
             else:
@@ -475,7 +611,11 @@ class MultiMCPTools(Toolkit):
         *,
         env: Optional[dict[str, str]] = None,
         server_params_list: Optional[
-            List[Union[SSEClientParams, StdioServerParameters, StreamableHTTPClientParams]]
+            List[
+                Union[
+                    SSEClientParams, StdioServerParameters, StreamableHTTPClientParams
+                ]
+            ]
         ] = None,
         timeout_seconds: int = 5,
         client=None,
@@ -513,11 +653,17 @@ class MultiMCPTools(Toolkit):
         for server_params in self.server_params_list:
             # Handle stdio connections
             if isinstance(server_params, StdioServerParameters):
-                stdio_transport = await self._async_exit_stack.enter_async_context(stdio_client(server_params))
+                stdio_transport = await self._async_exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
                 self._active_contexts.append(stdio_transport)
                 read, write = stdio_transport
                 session = await self._async_exit_stack.enter_async_context(
-                    ClientSession(read, write, read_timeout_seconds=timedelta(seconds=self.timeout_seconds))
+                    ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                    )
                 )
                 self._active_contexts.append(session)
                 await self.initialize(session)
@@ -528,7 +674,9 @@ class MultiMCPTools(Toolkit):
                 )
                 self._active_contexts.append(client_connection)
                 read, write = client_connection
-                session = await self._async_exit_stack.enter_async_context(ClientSession(read, write))
+                session = await self._async_exit_stack.enter_async_context(
+                    ClientSession(read, write)
+                )
                 self._active_contexts.append(session)
                 await self.initialize(session)
 
@@ -539,7 +687,9 @@ class MultiMCPTools(Toolkit):
                 )
                 self._active_contexts.append(client_connection)
                 read, write = client_connection[0:2]
-                session = await self._async_exit_stack.enter_async_context(ClientSession(read, write))
+                session = await self._async_exit_stack.enter_async_context(
+                    ClientSession(read, write)
+                )
                 self._active_contexts.append(session)
                 await self.initialize(session)
 
