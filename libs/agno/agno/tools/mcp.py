@@ -346,31 +346,52 @@ class MCPTools(Toolkit):
             raise
 
     async def _initialize_streamable_http_transient(self) -> None:
-        """Discover tools via a short-lived streamable-http session and register sync entrypoints."""
+        """Discover tools via a short-lived streamable-http session and register sync entrypoints.
+
+        Uses explicit context enter/exit with guarded exits to avoid AnyIO cancel-scope errors during cleanup.
+        """
         try:
             stream_params = asdict(self.server_params) if self.server_params is not None else {}
             if "url" not in stream_params and self.url is not None:
                 stream_params["url"] = self.url
             stream_params.setdefault("terminate_on_close", True)
 
-            # Open a transient connection only for discovery
-            async with streamablehttp_client(**stream_params) as client_conn:
+            client_cm = streamablehttp_client(**stream_params)
+            client_conn = await client_cm.__aenter__()
+            try:
                 read, write = client_conn[0:2]
-                async with ClientSession(
+                session_cm = ClientSession(
                     read,
                     write,
                     read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
-                ) as session:
+                )
+                session = await session_cm.__aenter__()
+                try:
                     await session.initialize()
                     available_tools = await session.list_tools()
+                finally:
+                    try:
+                        await session_cm.__aexit__(None, None, None)
+                    except RuntimeError as exc:
+                        log_warning(f"Ignoring session close RuntimeError: {exc}")
+            finally:
+                try:
+                    await client_cm.__aexit__(None, None, None)
+                except RuntimeError as exc:
+                    log_warning(f"Ignoring client close RuntimeError: {exc}")
 
-            # Apply include/exclude filters
-            filtered_tools = []
-            for tool in available_tools.tools:
-                if self.exclude_tools and tool.name in self.exclude_tools:
-                    continue
-                if self.include_tools is None or tool.name in self.include_tools:
-                    filtered_tools.append(tool)
+            # Apply include/exclude filters via existing checker for consistency
+            self._check_tools_filters(
+                available_tools=[tool.name for tool in available_tools.tools],
+                include_tools=self.include_tools,
+                exclude_tools=self.exclude_tools,
+            )
+            filtered_tools = [
+                tool
+                for tool in available_tools.tools
+                if (not self.exclude_tools or tool.name not in self.exclude_tools)
+                and (self.include_tools is None or tool.name in self.include_tools)
+            ]
 
             # Register sync entrypoints for these tools
             self._register_tools(filtered_tools)
@@ -396,15 +417,33 @@ class MCPTools(Toolkit):
                                     stream_params["url"] = self.url
                                 # Ensure termination on close to avoid lingering connections
                                 stream_params.setdefault("terminate_on_close", True)
-                                async with streamablehttp_client(**stream_params) as client_conn:
+
+                                # Explicit context management to guard __aexit__
+                                client_cm = streamablehttp_client(**stream_params)
+                                client_conn = await client_cm.__aenter__()
+                                try:
                                     read, write = client_conn[0:2]
-                                    async with ClientSession(
+                                    session_cm = ClientSession(
                                         read,
                                         write,
                                         read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
-                                    ) as session:
+                                    )
+                                    session = await session_cm.__aenter__()
+                                    try:
                                         await session.initialize()
-                                        return await session.call_tool(tool_name, arguments)
+                                        result = await session.call_tool(tool_name, arguments)
+                                    finally:
+                                        try:
+                                            await session_cm.__aexit__(None, None, None)
+                                        except RuntimeError as exc:
+                                            log_warning(f"Ignoring session close RuntimeError: {exc}")
+                                finally:
+                                    try:
+                                        await client_cm.__aexit__(None, None, None)
+                                    except RuntimeError as exc:
+                                        log_warning(f"Ignoring client close RuntimeError: {exc}")
+
+                                return result
 
                             # Run the async invocation inside a dedicated worker thread with its own loop
                             def run_in_thread():
