@@ -7,6 +7,7 @@ from types import TracebackType
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from agno.tools import Toolkit
+from concurrent.futures import ThreadPoolExecutor
 from agno.tools.function import Function
 from agno.utils.log import log_debug, log_info, log_warning, logger
 from agno.utils.mcp import get_entrypoint_for_tool
@@ -216,6 +217,12 @@ class MCPTools(Toolkit):
         if self._initialized:
             return
 
+        # For streamable-http, avoid creating persistent contexts/sessions.
+        # Perform transient initialization to register tools and exit.
+        if self.transport == "streamable-http":
+            await self._initialize_streamable_http_transient()
+            return
+
         if self.session is not None:
             await self.initialize()
             return
@@ -231,16 +238,9 @@ class MCPTools(Toolkit):
             self._context = sse_client(**sse_params)  # type: ignore
             client_timeout = min(self.timeout_seconds, sse_params.get("timeout", self.timeout_seconds))
 
-        # Create a new streamable HTTP session
+        # Create a new streamable HTTP session (handled transiently above)
         elif self.transport == "streamable-http":
-            streamable_http_params = asdict(self.server_params) if self.server_params is not None else {}  # type: ignore
-            if "url" not in streamable_http_params:
-                streamable_http_params["url"] = self.url
-            self._context = streamablehttp_client(**streamable_http_params)  # type: ignore
-            params_timeout = streamable_http_params.get("timeout", self.timeout_seconds)
-            if isinstance(params_timeout, timedelta):
-                params_timeout = int(params_timeout.total_seconds())
-            client_timeout = min(self.timeout_seconds, params_timeout)
+            raise RuntimeError("Unexpected persistent streamable-http connection path")
 
         else:
             if self.server_params is None:
@@ -261,14 +261,27 @@ class MCPTools(Toolkit):
 
     async def close(self) -> None:
         """Close the MCP connection and clean up resources"""
+        # No-op for streamable-http, since connections are per-call and already closed
+        if self.transport == "streamable-http":
+            self._initialized = False
+            return
+
         if self._session_context is not None:
-            await self._session_context.__aexit__(None, None, None)
-            self.session = None
-            self._session_context = None
+            try:
+                await self._session_context.__aexit__(None, None, None)
+            except RuntimeError as exc:
+                log_warning(f"Ignoring session close RuntimeError: {exc}")
+            finally:
+                self.session = None
+                self._session_context = None
 
         if self._context is not None:
-            await self._context.__aexit__(None, None, None)
-            self._context = None
+            try:
+                await self._context.__aexit__(None, None, None)
+            except RuntimeError as exc:
+                log_warning(f"Ignoring context close RuntimeError: {exc}")
+            finally:
+                self._context = None
 
         self._initialized = False
 
@@ -292,6 +305,11 @@ class MCPTools(Toolkit):
     async def initialize(self) -> None:
         """Initialize the MCP toolkit by getting available tools from the MCP server"""
         if self._initialized:
+            return
+
+        # Handle streamable-http with transient discovery
+        if self.transport == "streamable-http":
+            await self._initialize_streamable_http_transient()
             return
 
         try:
@@ -319,31 +337,146 @@ class MCPTools(Toolkit):
                     filtered_tools.append(tool)
 
             # Register the tools with the toolkit
-            for tool in filtered_tools:
-                try:
-                    # Get an entrypoint for the tool
-                    entrypoint = get_entrypoint_for_tool(tool, self.session)
-                    # Create a Function for the tool
-                    f = Function(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.inputSchema,
-                        entrypoint=entrypoint,
-                        # Set skip_entrypoint_processing to True to avoid processing the entrypoint
-                        skip_entrypoint_processing=True,
-                    )
-
-                    # Register the Function with the toolkit
-                    self.functions[f.name] = f
-                    log_debug(f"Function: {f.name} registered with {self.name}")
-                except Exception as e:
-                    logger.error(f"Failed to register tool {tool.name}: {e}")
+            self._register_tools(filtered_tools)
 
             log_debug(f"{self.name} initialized with {len(filtered_tools)} tools")
             self._initialized = True
         except Exception as e:
             logger.error(f"Failed to get MCP tools: {e}")
             raise
+
+    async def _initialize_streamable_http_transient(self) -> None:
+        """Discover tools via a short-lived streamable-http session and register sync entrypoints.
+
+        Uses explicit context enter/exit with guarded exits to avoid AnyIO cancel-scope errors during cleanup.
+        """
+        try:
+            stream_params = asdict(self.server_params) if self.server_params is not None else {}
+            if "url" not in stream_params and self.url is not None:
+                stream_params["url"] = self.url
+            stream_params.setdefault("terminate_on_close", True)
+
+            client_cm = streamablehttp_client(**stream_params)
+            client_conn = await client_cm.__aenter__()
+            try:
+                read, write = client_conn[0:2]
+                session_cm = ClientSession(
+                    read,
+                    write,
+                    read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                )
+                session = await session_cm.__aenter__()
+                try:
+                    await session.initialize()
+                    available_tools = await session.list_tools()
+                finally:
+                    try:
+                        await session_cm.__aexit__(None, None, None)
+                    except RuntimeError as exc:
+                        log_warning(f"Ignoring session close RuntimeError: {exc}")
+            finally:
+                try:
+                    await client_cm.__aexit__(None, None, None)
+                except RuntimeError as exc:
+                    log_warning(f"Ignoring client close RuntimeError: {exc}")
+
+            # Apply include/exclude filters via existing checker for consistency
+            self._check_tools_filters(
+                available_tools=[tool.name for tool in available_tools.tools],
+                include_tools=self.include_tools,
+                exclude_tools=self.exclude_tools,
+            )
+            filtered_tools = [
+                tool
+                for tool in available_tools.tools
+                if (not self.exclude_tools or tool.name not in self.exclude_tools)
+                and (self.include_tools is None or tool.name in self.include_tools)
+            ]
+
+            # Register sync entrypoints for these tools
+            self._register_tools(filtered_tools)
+            log_debug(f"{self.name} initialized with {len(filtered_tools)} tools (streamable-http)")
+            self._initialized = True
+        except Exception as e:
+            logger.error(f"Failed to get MCP tools (streamable-http): {e}")
+            raise
+
+    def _register_tools(self, tools_list):
+        """Register tools with appropriate entrypoints based on transport."""
+        for tool in tools_list:
+            try:
+                # For streamable-http transport, register a synchronous entrypoint so Agent.run can be used.
+                if self.transport == "streamable-http":
+
+                    def make_sync_entrypoint(tool_name: str):
+                        def sync_entrypoint(**arguments):
+                            async def _invoke():
+                                # Build params from configured server_params/url
+                                stream_params = asdict(self.server_params) if self.server_params is not None else {}
+                                if "url" not in stream_params and self.url is not None:
+                                    stream_params["url"] = self.url
+                                # Ensure termination on close to avoid lingering connections
+                                stream_params.setdefault("terminate_on_close", True)
+
+                                # Explicit context management to guard __aexit__
+                                client_cm = streamablehttp_client(**stream_params)
+                                client_conn = await client_cm.__aenter__()
+                                try:
+                                    read, write = client_conn[0:2]
+                                    session_cm = ClientSession(
+                                        read,
+                                        write,
+                                        read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                                    )
+                                    session = await session_cm.__aenter__()
+                                    try:
+                                        await session.initialize()
+                                        result = await session.call_tool(tool_name, arguments)
+                                    finally:
+                                        try:
+                                            await session_cm.__aexit__(None, None, None)
+                                        except RuntimeError as exc:
+                                            log_warning(f"Ignoring session close RuntimeError: {exc}")
+                                finally:
+                                    try:
+                                        await client_cm.__aexit__(None, None, None)
+                                    except RuntimeError as exc:
+                                        log_warning(f"Ignoring client close RuntimeError: {exc}")
+
+                                return result
+
+                            # Run the async invocation inside a dedicated worker thread with its own loop
+                            def run_in_thread():
+                                import asyncio as _asyncio
+
+                                return _asyncio.run(_invoke())
+
+                            with ThreadPoolExecutor(max_workers=1) as executor:
+                                future = executor.submit(run_in_thread)
+                                return future.result()
+
+                        return sync_entrypoint
+
+                    entrypoint_callable = make_sync_entrypoint(tool.name)
+                else:
+                    # Default: use the async entrypoint (works with Agent.arun/Team.aprint_response)
+                    entrypoint_callable = get_entrypoint_for_tool(tool, self.session)
+
+                # Create a Function for the tool
+                f = Function(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.inputSchema,
+                    entrypoint=entrypoint_callable,
+                    # Set skip_entrypoint_processing to True to avoid processing the entrypoint
+                    skip_entrypoint_processing=True,
+                )
+
+                # Register the Function with the toolkit
+                self.functions[f.name] = f
+                log_debug(f"Function: {f.name} registered with {self.name}")
+            except Exception as e:
+                logger.error(f"Failed to register tool {tool.name}: {e}")
 
 
 class MultiMCPTools(Toolkit):
@@ -517,7 +650,11 @@ class MultiMCPTools(Toolkit):
                 self._active_contexts.append(stdio_transport)
                 read, write = stdio_transport
                 session = await self._async_exit_stack.enter_async_context(
-                    ClientSession(read, write, read_timeout_seconds=timedelta(seconds=self.timeout_seconds))
+                    ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=timedelta(seconds=self.timeout_seconds),
+                    )
                 )
                 self._active_contexts.append(session)
                 await self.initialize(session)
